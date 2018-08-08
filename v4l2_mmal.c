@@ -48,6 +48,23 @@
 #include "bcm_host.h"
 #include "user-vcsm.h"
 
+#define MAX_COMPONENTS 4
+
+struct destinations {
+	char *component_name;
+	MMAL_FOURCC_T output_encoding;
+	MMAL_PORT_BH_CB_T cb;
+};
+
+static void encoder_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer);
+#define MMAL_ENCODING_UNUSED 0
+
+struct destinations dests[MAX_COMPONENTS] = {
+	{"vc.ril.video_encode", MMAL_ENCODING_H264, encoder_buffer_callback},
+	{"vc.ril.image_encode", MMAL_ENCODING_JPEG, encoder_buffer_callback},
+	{"vc.ril.video_render", MMAL_ENCODING_UNUSED, NULL},
+	{NULL, MMAL_ENCODING_UNUSED, NULL}
+};
 
 
 #ifndef V4L2_BUF_FLAG_ERROR
@@ -72,6 +89,18 @@ struct buffer
 	unsigned int vcsm_handle;
 };
 
+struct component {
+	MMAL_COMPONENT_T *comp;
+	MMAL_POOL_T *ip_pool;
+	MMAL_POOL_T *op_pool;
+	FILE *stream_fd;
+	FILE *pts_fd;
+
+	VCOS_THREAD_T save_thread;
+	MMAL_QUEUE_T *save_queue;
+	int thread_quit;
+};
+
 struct device
 {
 	int fd;
@@ -81,11 +110,9 @@ struct device
 	struct buffer *buffers;
 
 	MMAL_COMPONENT_T *isp;
-	MMAL_COMPONENT_T *render;
-	MMAL_COMPONENT_T *encoder;
 	MMAL_POOL_T *isp_output_pool;
-	MMAL_POOL_T *render_pool;
-	MMAL_POOL_T *encode_pool;
+
+	struct component components[MAX_COMPONENTS];
 
 	/* V4L2 to MMAL interface */
 	MMAL_QUEUE_T *isp_queue;
@@ -107,16 +134,8 @@ struct device
 	unsigned char num_planes;
 
 	void *pattern[VIDEO_MAX_PLANES];
-	unsigned int patternsize[VIDEO_MAX_PLANES];
 
 	bool write_data_prefix;
-
-
-	VCOS_THREAD_T save_thread;
-	MMAL_QUEUE_T *save_queue;
-	int thread_quit;
-	FILE *h264_fd;
-	FILE *pts_fd;
 };
 
 static void errno_exit(const char *s)
@@ -124,8 +143,6 @@ static void errno_exit(const char *s)
         fprintf(stderr, "%s error %d, %s\n", s, errno, strerror(errno));
         exit(EXIT_FAILURE);
 }
-
-#define MMAL_ENCODING_UNUSED 0
 
 static struct v4l2_format_info {
 	const char *name;
@@ -788,41 +805,38 @@ static void isp_ip_cb(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer)
 
 static void * save_thread(void *arg)
 {
-	struct device *dev = (struct device *)arg;
+	struct component *comp = (struct component *)arg;
 	MMAL_BUFFER_HEADER_T *buffer;
 	MMAL_STATUS_T status;
 	unsigned int bytes_written;
 
-	while (!dev->thread_quit)
+	while (!comp->thread_quit)
 	{
 		//Being lazy and using a timed wait instead of setting up a
 		//mechanism for skipping this when destroying the thread
-		buffer = mmal_queue_timedwait(dev->save_queue, 50000);
+		buffer = mmal_queue_timedwait(comp->save_queue, 1000);
 		if (!buffer)
 			continue;
 
 		//print("Buffer %p saving, filled %d, timestamp %llu, flags %04X\n", buffer, buffer->length, buffer->pts, buffer->flags);
-		if (dev->h264_fd)
+		if (comp->stream_fd)
 		{
-			bytes_written = fwrite(buffer->data, 1, buffer->length, dev->h264_fd);
-			fflush(dev->h264_fd);
+			bytes_written = fwrite(buffer->data, 1, buffer->length, comp->stream_fd);
+			fflush(comp->stream_fd);
 
 			if (bytes_written != buffer->length)
 			{
 				print("Failed to write buffer data (%d from %d)- aborting", bytes_written, buffer->length);
 			}
 		}
-		else
-		{
-			print("No file to save to\n");
-		}
-		if (dev->pts_fd &&
+
+		if (comp->pts_fd &&
 		    !(buffer->flags & MMAL_BUFFER_HEADER_FLAG_CONFIG) &&
 		    buffer->pts != MMAL_TIME_UNKNOWN)
-			fprintf(dev->pts_fd, "%lld.%03lld\n", buffer->pts/1000, buffer->pts%1000);
+			fprintf(comp->pts_fd, "%lld.%03lld\n", buffer->pts/1000, buffer->pts%1000);
 
 		buffer->length = 0;
-		status = mmal_port_send_buffer(dev->encoder->output[0], buffer);
+		status = mmal_port_send_buffer(comp->comp->output[0], buffer);
 		if(status != MMAL_SUCCESS)
 		{
 			print("mmal_port_send_buffer failed on buffer %p, status %d", buffer, status);
@@ -833,16 +847,26 @@ static void * save_thread(void *arg)
 
 static void encoder_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer)
 {
-	struct device *dev = (struct device *)port->userdata;
+	struct component *comp = (struct component *)port->userdata;
 
 	//print("Buffer %p returned, filled %d, timestamp %llu, flags %04X\n", buffer, buffer->length, buffer->pts, buffer->flags);
 	//vcos_log_error("File handle: %p", port->userdata);
 
 	if (port->is_enabled)
-		mmal_queue_put(dev->save_queue, buffer);
+		mmal_queue_put(comp->save_queue, buffer);
 	else
 		mmal_buffer_header_release(buffer);
 }
+
+/*static void dummy_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer)
+{
+	print("Buffer %p returned, filled %d, timestamp %llu, flags %04X\n", buffer, buffer->length, buffer->pts, buffer->flags);
+
+	if (port->is_enabled)
+		mmal_port_send_buffer(port, buffer);
+	else
+		mmal_buffer_header_release(buffer);
+}*/
 
 static void buffers_to_isp(struct device *dev)
 {
@@ -859,23 +883,15 @@ static void isp_output_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer)
 	//print("Buffer %p from isp, filled %d, timestamp %llu, flags %04X\n", buffer, buffer->length, buffer->pts, buffer->flags);
 	//vcos_log_error("File handle: %p", port->userdata);
 	struct device *dev = (struct device*)port->userdata;
+	int i;
 
-	if (dev->render)
+	for (i=0; i<MAX_COMPONENTS && dev->components[i].comp; i++)
 	{
-		MMAL_BUFFER_HEADER_T *out = mmal_queue_get(dev->render_pool->queue);
+		MMAL_BUFFER_HEADER_T *out = mmal_queue_get(dev->components[i].ip_pool->queue);
 		if (out)
 		{
 			mmal_buffer_header_replicate(out, buffer);
-			mmal_port_send_buffer(dev->render->input[0], out);
-		}
-	}
-	if (dev->encoder)
-	{
-		MMAL_BUFFER_HEADER_T *out = mmal_queue_get(dev->encode_pool->queue);
-		if (out)
-		{
-			mmal_buffer_header_replicate(out, buffer);
-			mmal_port_send_buffer(dev->encoder->input[0], out);
+			mmal_port_send_buffer(dev->components[i].comp->input[0], out);
 		}
 	}
 	mmal_buffer_header_release(buffer);
@@ -883,7 +899,7 @@ static void isp_output_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer)
 	buffers_to_isp(dev);
 }
 
-static void render_encoder_input_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer)
+static void sink_input_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer)
 {
 	//print("Buffer %p returned from %s, filled %d, timestamp %llu, flags %04X\n", buffer, port->name, buffer->length, buffer->pts, buffer->flags);
 	//vcos_log_error("File handle: %p", port->userdata);
@@ -1015,15 +1031,15 @@ int mmal_dump_supported_formats(MMAL_PORT_T *port)
    return new_fw;
 }
 
-static int setup_mmal(struct device *dev, int nbufs, int do_encode, const char *filename)
+static int setup_mmal(struct device *dev, int nbufs, const char *filename)
 {
 	MMAL_STATUS_T status;
 	VCOS_STATUS_T vcos_status;
 	MMAL_PORT_T *port;
 	const struct v4l2_format_info *info;
 	struct v4l2_format fmt;
-	int ret;
-	MMAL_PORT_T *isp_output, *encoder_input, *encoder_output;
+	int ret, i;
+	MMAL_PORT_T *isp_output;
 
 	//FIXME: Clean up after errors
 
@@ -1032,26 +1048,6 @@ static int setup_mmal(struct device *dev, int nbufs, int do_encode, const char *
 	{
 		print("Failed to create isp\n");
 		return -1;
-	}
-
-	if (do_encode)
-	{
-		status = mmal_component_create("vc.ril.video_encode", &dev->encoder);
-		if(status != MMAL_SUCCESS)
-		{
-			print("Failed to create encoder");
-			return -1;
-		}
-	}
-
-	if (1)
-	{
-		status = mmal_component_create("vc.ril.video_render", &dev->render);
-		if(status != MMAL_SUCCESS)
-		{
-			print("Failed to create render\n");
-			return -1;
-		}
 	}
 
 	port = dev->isp->input[0];
@@ -1107,7 +1103,7 @@ static int setup_mmal(struct device *dev, int nbufs, int do_encode, const char *
 	}
 
 
-	if (mmal_port_parameter_set_boolean(port, MMAL_PARAMETER_ZERO_COPY, VCSM_IMPORT_DMABUF) != MMAL_SUCCESS)
+	if (mmal_port_parameter_set_boolean(port, MMAL_PARAMETER_ZERO_COPY, MMAL_TRUE) != MMAL_SUCCESS)
 	{
 		print("Failed to set zero copy\n");
 		return -1;
@@ -1127,176 +1123,226 @@ static int setup_mmal(struct device *dev, int nbufs, int do_encode, const char *
 		return -1;
 	}
 
-	mmal_format_copy(dev->isp->output[0]->format, port->format);
-	port = dev->isp->output[0];
-	port->format->encoding = MMAL_ENCODING_RGBA;
-	port->buffer_num = 3;
-	//port->format->es->video.width = (port->format->es->video.crop.width+15) & ~15;
-	//mmal_encoding_stride_to_width(port->format->encoding, fmt.fmt.pix.bytesperline);
-	/* FIXME - buffer may not be aligned vertically */
-	//port->format->es->video.height = (fmt.fmt.pix.height+15) & ~15;
-	//port->format->es->video.crop.height = fmt.fmt.pix.height;
+	/* Setup ISP output */
+	isp_output = dev->isp->output[0];
+	mmal_format_copy(isp_output->format, port->format);
+	isp_output = dev->isp->output[0];
+	isp_output->format->encoding = MMAL_ENCODING_I420;
+	isp_output->buffer_num = 3;
 
-	status = mmal_port_format_commit(port);
+	status = mmal_port_format_commit(isp_output);
 	if (status != MMAL_SUCCESS)
 	{
 		print("ISP o/p commit failed\n");
 		return -1;
 	}
-	print("format->video.size now %dx%d\n", port->format->es->video.width, port->format->es->video.height);
-
-	isp_output = dev->isp->output[0];
-
-	if (dev->render)
-	{
-		status = mmal_format_full_copy(dev->render->input[0]->format, isp_output->format);
-		dev->render->input[0]->buffer_num = 3;
-		if (status == MMAL_SUCCESS)
-			status = mmal_port_format_commit(dev->render->input[0]);
-	}
-
-	//  Encoder setup
-	if (dev->encoder)
-	{
-		encoder_input = dev->encoder->input[0];
-		encoder_output = dev->encoder->output[0];
-
-		mmal_dump_supported_formats(encoder_input);
-
-		status = mmal_format_full_copy(encoder_input->format, isp_output->format);
-		encoder_input->buffer_num = 3;
-		if (status == MMAL_SUCCESS)
-			status = mmal_port_format_commit(encoder_input);
-
-		// Only supporting H264 at the moment
-		encoder_output->format->encoding = MMAL_ENCODING_H264;
-
-		encoder_output->format->bitrate = 10000000;
-		encoder_output->buffer_size = 256<<10;//encoder_output->buffer_size_recommended;
-
-		if (encoder_output->buffer_size < encoder_output->buffer_size_min)
-			encoder_output->buffer_size = encoder_output->buffer_size_min;
-
-		encoder_output->buffer_num = 8; //encoder_output->buffer_num_recommended;
-
-		if (encoder_output->buffer_num < encoder_output->buffer_num_min)
-			encoder_output->buffer_num = encoder_output->buffer_num_min;
-
-		// We need to set the frame rate on output to 0, to ensure it gets
-		// updated correctly from the input framerate when port connected
-		encoder_output->format->es->video.frame_rate.num = 0;
-		encoder_output->format->es->video.frame_rate.den = 1;
-
-		encoder_output->format->es->video.par.num = 64;
-		encoder_output->format->es->video.par.den = 45;
-
-		// Commit the port changes to the output port
-		status = mmal_port_format_commit(encoder_output);
-
-		if (status != MMAL_SUCCESS)
-		{
-			print("Unable to set format on encoder output port\n");
-		}
-
-		{
-			MMAL_PARAMETER_VIDEO_PROFILE_T  param;
-			param.hdr.id = MMAL_PARAMETER_PROFILE;
-			param.hdr.size = sizeof(param);
-
-			param.profile[0].profile = MMAL_VIDEO_PROFILE_H264_HIGH;//state->profile;
-			param.profile[0].level = MMAL_VIDEO_LEVEL_H264_4;
-
-			status = mmal_port_parameter_set(encoder_output, &param.hdr);
-			if (status != MMAL_SUCCESS)
-			{
-				print("Unable to set H264 profile\n");
-			}
-		}
-
-		if (mmal_port_parameter_set_boolean(encoder_input, MMAL_PARAMETER_VIDEO_IMMUTABLE_INPUT, 1) != MMAL_SUCCESS)
-		{
-			print("Unable to set immutable input flag\n");
-			// Continue rather than abort..
-		}
-
-		//set INLINE HEADER flag to generate SPS and PPS for every IDR if requested
-		if (mmal_port_parameter_set_boolean(encoder_output, MMAL_PARAMETER_VIDEO_ENCODE_INLINE_HEADER, 0) != MMAL_SUCCESS)
-		{
-			print("failed to set INLINE HEADER FLAG parameters\n");
-			// Continue rather than abort..
-		}
-
-		//set INLINE VECTORS flag to request motion vector estimates
-		if (mmal_port_parameter_set_boolean(encoder_output, MMAL_PARAMETER_VIDEO_ENCODE_INLINE_VECTORS, 0) != MMAL_SUCCESS)
-		{
-			print("failed to set INLINE VECTORS parameters\n");
-			// Continue rather than abort..
-		}
-
-		if (status != MMAL_SUCCESS)
-		{
-			print("Unable to set format on video encoder input port\n");
-		}
-
-		print("Enable encoder....\n");
-		status = mmal_component_enable(dev->encoder);
-		if(status != MMAL_SUCCESS)
-		{
-			print("Failed to enable\n");
-			return -1;
-		}
-		status = mmal_port_parameter_set_boolean(encoder_output, MMAL_PARAMETER_ZERO_COPY, MMAL_TRUE);
-		status += mmal_port_parameter_set_boolean(encoder_input, MMAL_PARAMETER_ZERO_COPY, MMAL_TRUE);
-		if(status != MMAL_SUCCESS)
-		{
-			print("Failed to set zero copy\n");
-			return -1;
-		}
-		encoder_input->userdata = (struct MMAL_PORT_USERDATA_T *)dev;
-	}
+	print("format->video.size now %dx%d\n", isp_output->format->es->video.width, isp_output->format->es->video.height);
 
 	status = mmal_port_parameter_set_boolean(isp_output, MMAL_PARAMETER_ZERO_COPY, MMAL_TRUE);
 
 	isp_output->userdata = (struct MMAL_PORT_USERDATA_T *)dev;
 
-	if (dev->render)
+	/* Set up all the sink components */
+	for(i=0; i<MAX_COMPONENTS && dests[i].component_name; i++)
 	{
-		status += mmal_port_parameter_set_boolean(dev->render->input[0], MMAL_PARAMETER_ZERO_COPY, MMAL_TRUE);
-		if (status != MMAL_SUCCESS)
+		MMAL_COMPONENT_T *comp;
+		MMAL_PORT_T *ip, *op = NULL;
+		status = mmal_component_create(dests[i].component_name, &comp);
+		if(status != MMAL_SUCCESS)
 		{
+			print("Failed to create %s", dests[i].component_name);
+			return -1;
+		}
+		dev->components[i].comp = comp;
+		ip = comp->input[0];
+
+		status = mmal_format_full_copy(ip->format, isp_output->format);
+		ip->buffer_num = 3;
+		if (status == MMAL_SUCCESS)
+			status = mmal_port_format_commit(ip);
+
+		status += mmal_port_parameter_set_boolean(ip, MMAL_PARAMETER_ZERO_COPY, MMAL_TRUE);
+		if (status != MMAL_SUCCESS)
+			return -1;
+
+		ip->userdata = (struct MMAL_PORT_USERDATA_T *)dev;
+
+		//Set up the output of the sink component
+		if (dests[i].output_encoding != MMAL_ENCODING_UNUSED && comp->output_num)
+		{
+			print("Setup output port\n");
+			op = comp->output[0];
+			op->format->encoding = dests[i].output_encoding;
+
+			//This may not be relevant, but I'm not making it configurable
+			op->format->bitrate = 10000000;
+			op->buffer_size = 256<<10;
+
+			if (op->buffer_size < op->buffer_size_min)
+				op->buffer_size = op->buffer_size_min;
+
+			op->buffer_num = 8;
+
+			if (op->buffer_num < op->buffer_num_min)
+				op->buffer_num = op->buffer_num_min;
+
+			// We need to set the frame rate on output to 0, to ensure it gets
+			// updated correctly from the input framerate when port connected
+			op->format->es->video.frame_rate.num = 0;
+			op->format->es->video.frame_rate.den = 1;
+
+			// Commit the port changes to the output port
+			status = mmal_port_format_commit(op);
+			if (status != MMAL_SUCCESS)
+			{
+				print("Unable to set format on encoder output port\n");
+			}
+
+
+			status = mmal_port_parameter_set_boolean(op, MMAL_PARAMETER_ZERO_COPY, MMAL_TRUE);
+			if (status != MMAL_SUCCESS)
+			{
+				print("Could not enable zero copy on %s output port\n", dests[i].component_name);
+			}
+
+			if (op->format->encoding == MMAL_ENCODING_H264)
+			{
+				MMAL_PARAMETER_VIDEO_PROFILE_T  param;
+				param.hdr.id = MMAL_PARAMETER_PROFILE;
+				param.hdr.size = sizeof(param);
+
+				param.profile[0].profile = MMAL_VIDEO_PROFILE_H264_HIGH;//state->profile;
+				param.profile[0].level = MMAL_VIDEO_LEVEL_H264_4;
+
+				status = mmal_port_parameter_set(op, &param.hdr);
+				if (status != MMAL_SUCCESS)
+				{
+					print("Unable to set H264 profile\n");
+				}
+
+				if (mmal_port_parameter_set_boolean(ip, MMAL_PARAMETER_VIDEO_IMMUTABLE_INPUT, 1) != MMAL_SUCCESS)
+				{
+					print("Unable to set immutable input flag\n");
+					// Continue rather than abort..
+				}
+
+				//set INLINE HEADER flag to generate SPS and PPS for every IDR if requested
+				if (mmal_port_parameter_set_boolean(op, MMAL_PARAMETER_VIDEO_ENCODE_INLINE_HEADER, 0) != MMAL_SUCCESS)
+				{
+					print("failed to set INLINE HEADER FLAG parameters\n");
+					// Continue rather than abort..
+				}
+			}
+
+			status = mmal_port_parameter_set_boolean(op, MMAL_PARAMETER_ZERO_COPY, MMAL_TRUE);
+			if(status != MMAL_SUCCESS)
+			{
+				print("Failed to set zero copy\n");
+				return -1;
+			}
+			op->userdata = (struct MMAL_PORT_USERDATA_T *)&dev->components[i];
+
+			/* Setup the output files */
+			if (filename[0] == '-' && filename[1] == '\0')
+			{
+				dev->components[i].stream_fd = stdout;
+				debug = 0;
+			}
+			else
+			{
+				char tmp_filename[128];
+				sprintf(tmp_filename, "%u_%s", i, filename);
+
+				printf("Writing data to %s\n", tmp_filename);
+				dev->components[i].stream_fd = fopen(tmp_filename, "wb");
+			}
+
+			{
+				char tmp_filename[128];
+				sprintf(tmp_filename, "%u_%s.pts", i, filename);
+
+				dev->components[i].pts_fd = (void*)fopen(tmp_filename, "wb");
+				if (dev->components[i].pts_fd) /* save header for mkvmerge */
+					fprintf(dev->components[i].pts_fd, "# timecode format v2\n");
+			}
+
+			dev->components[i].save_queue = mmal_queue_create();
+			if(!dev->components[i].save_queue)
+			{
+				print("Failed to create queue\n");
+				return -1;
+			}
+
+			vcos_status = vcos_thread_create(&dev->components[i].save_thread, "save-thread",
+						NULL, save_thread, &dev->components[i]);
+			if(vcos_status != VCOS_SUCCESS)
+			{
+				print("Failed to create save thread\n");
+				return -1;
+			}
+
+		}
+
+		status = mmal_port_enable(ip, sink_input_callback);
+		if (status != MMAL_SUCCESS)
+			return -1;
+
+		print("Create pool of %d buffers for %s\n",
+						ip->buffer_num,
+						dests[i].component_name);
+		dev->components[i].ip_pool = mmal_port_pool_create(ip, ip->buffer_num, 0);
+		if(!dev->components[i].ip_pool)
+		{
+			print("Failed to create %s ip pool\n", dests[i].component_name);
 			return -1;
 		}
 
-		dev->render->input[0]->userdata = (struct MMAL_PORT_USERDATA_T *)dev;
-
-		status = mmal_port_enable(dev->render->input[0], render_encoder_input_callback);
-		if (status != MMAL_SUCCESS)
-			return -1;
-
-		print("Create pool of %d buffers of size %d for render\n", dev->render->input[0]->buffer_num, 0);
-		dev->render_pool = mmal_port_pool_create(dev->render->input[0], dev->render->input[0]->buffer_num, dev->render->input[0]->buffer_size);
-		if(!dev->render_pool)
+		if (op)
 		{
-			print("Failed to create render pool\n");
+			print("Create pool of %d buffers for %s\n",
+							op->buffer_num,
+							dests[i].component_name);
+			dev->components[i].op_pool = mmal_port_pool_create(op, op->buffer_num, op->buffer_size);
+			if(!dev->components[i].op_pool)
+			{
+				print("Failed to create %s op pool\n", dests[i].component_name);
+				return -1;
+			}
+
+			status = mmal_port_enable(op, dests[i].cb);
+			if (status != MMAL_SUCCESS)
+				return -1;
+
+			unsigned int j;
+			for(j=0; j<op->buffer_num; j++)
+			{
+				MMAL_BUFFER_HEADER_T *buffer = mmal_queue_get(dev->components[i].op_pool->queue);
+
+				if (!buffer)
+				{
+					print("Where'd my buffer go?!\n");
+					return -1;
+				}
+				status = mmal_port_send_buffer(op, buffer);
+				if(status != MMAL_SUCCESS)
+				{
+					print("mmal_port_send_buffer failed on buffer %p, status %d\n", buffer, status);
+					return -1;
+				}
+				print("Sent buffer %p", buffer);
+			}
+		}
+
+		print("Enable %s....\n", dests[i].component_name);
+		status = mmal_component_enable(comp);
+		if(status != MMAL_SUCCESS)
+		{
+			print("Failed to enable\n");
 			return -1;
 		}
 	}
 
-	if (dev->encoder)
-	{
-		status = mmal_port_enable(encoder_input, render_encoder_input_callback);
-		if (status != MMAL_SUCCESS)
-			return -1;
-
-		print("Create pool of %d buffers of size %d for encode ip\n", encoder_input->buffer_num, 0);
-		dev->encode_pool = mmal_port_pool_create(encoder_input, isp_output->buffer_num, isp_output->buffer_size);
-		if(!dev->encode_pool)
-		{
-			print("Failed to create encode ip pool\n");
-			return -1;
-		}
-	}
-
+	/* All setup, so enable the ISP output and feed it the buffers */
 	status = mmal_port_enable(isp_output, isp_output_callback);
 	if (status != MMAL_SUCCESS)
 		return -1;
@@ -1311,85 +1357,23 @@ static int setup_mmal(struct device *dev, int nbufs, int do_encode, const char *
 
 	buffers_to_isp(dev);
 
-	// open h264 file and put the file handle in userdata for the encoder output port
-	if (do_encode)
-	{
-		if (filename[0] == '-' && filename[1] == '\0')
-		{
-			dev->h264_fd = stdout;
-			debug = 0;
-		}
-		else {
-			printf("Writing data to %s\n", filename);
-			dev->h264_fd = fopen(filename, "wb");
-		}
-
-		dev->pts_fd = (void*)fopen("file.pts", "wb");
-		if (dev->pts_fd) /* save header for mkvmerge */
-			fprintf(dev->pts_fd, "# timecode format v2\n");
-
-		encoder_output->userdata = (void*)dev;
-
-		//Create encoder output buffers
-
-		print("Create pool of %d buffers of size %d\n", encoder_output->buffer_num, encoder_output->buffer_size);
-		dev->output_pool = mmal_port_pool_create(encoder_output, encoder_output->buffer_num, encoder_output->buffer_size);
-		if(!dev->output_pool)
-		{
-			print("Failed to create pool\n");
-			return -1;
-		}
-
-		dev->save_queue = mmal_queue_create();
-		if(!dev->save_queue)
-		{
-			print("Failed to create queue\n");
-			return -1;
-		}
-
-		vcos_status = vcos_thread_create(&dev->save_thread, "save-thread",
-					NULL, save_thread, dev);
-		if(vcos_status != VCOS_SUCCESS)
-		{
-			print("Failed to create save thread\n");
-			return -1;
-		}
-
-		status = mmal_port_enable(encoder_output, encoder_buffer_callback);
-		if(status != MMAL_SUCCESS)
-		{
-			print("Failed to enable port\n");
-			return -1;
-		}
-
-		unsigned int i;
-		for(i=0; i<encoder_output->buffer_num; i++)
-		{
-			MMAL_BUFFER_HEADER_T *buffer = mmal_queue_get(dev->output_pool->queue);
-
-			if (!buffer)
-			{
-				print("Where'd my buffer go?!\n");
-				return -1;
-			}
-			status = mmal_port_send_buffer(encoder_output, buffer);
-			if(status != MMAL_SUCCESS)
-			{
-				print("mmal_port_send_buffer failed on buffer %p, status %d\n", buffer, status);
-				return -1;
-			}
-			print("Sent buffer %p", buffer);
-		}
-	}
-
 	return 0;
 }
 
 static void destroy_mmal(struct device *dev)
 {
+	int i;
 	//FIXME: Clean up everything properly
-	dev->thread_quit = 1;
-	vcos_thread_join(&dev->save_thread, NULL);
+	for (i=0; i<MAX_COMPONENTS; i++)
+	{
+		dev->components[i].thread_quit = 1;
+		vcos_thread_join(&dev->components[i].save_thread, NULL);
+
+		if (dev->components[i].stream_fd)
+			fclose(dev->components[i].stream_fd);
+		if (dev->components[i].pts_fd)
+			fclose(dev->components[i].pts_fd);
+	}
 }
 
 static void video_save_image(struct device *dev, struct v4l2_buffer *buf,
@@ -1820,7 +1804,6 @@ int main(int argc, char *argv[])
 	int do_requeue_last = 0;
 	int do_log_status = 0;
 	int no_query = 0, do_queue_late = 0;
-	int do_encode = 0;
 	int do_set_dv_timings = 0;
 	char *endptr;
 	int c;
@@ -1855,7 +1838,6 @@ int main(int argc, char *argv[])
 			break;
 		case 'E':
 			print("We're encoding to %s\n", optarg);
-			do_encode = 1;
 			if (optarg)
 				encode_filename = optarg;
 			break;
@@ -2013,7 +1995,7 @@ int main(int argc, char *argv[])
 	if (!dev.fps)
 		video_get_fps(&dev);
 
-	setup_mmal(&dev, nbufs, do_encode, encode_filename);
+	setup_mmal(&dev, nbufs, encode_filename);
 
 	if (!do_capture) {
 		video_close(&dev);
