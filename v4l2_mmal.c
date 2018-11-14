@@ -1578,7 +1578,7 @@ static int video_do_capture(struct device *dev, unsigned int nframes,
 					timersub(&buf.timestamp, &dev->starttime, &pts);
 					//MMAL PTS is in usecs, so convert from struct timeval
 					mmal->pts = (pts.tv_sec * 1000000) + pts.tv_usec;
-					if (mmal->pts > (dev->lastpts+dev->frame_time_usec+1000)) {
+					if (mmal->pts > (dev->lastpts+dev->frame_time_usec+2500)) {
 						print("DROPPED FRAME - %lld and %lld, delta %lld\n", dev->lastpts, mmal->pts, mmal->pts-dev->lastpts);
 						dropped_frames++;
 					}
@@ -1718,11 +1718,11 @@ int video_get_fps(struct device *dev)
 	}
 
 	print("Current frame rate: %u/%u\n",
-		parm.parm.capture.timeperframe.numerator,
-		parm.parm.capture.timeperframe.denominator);
+		parm.parm.capture.timeperframe.denominator,
+		parm.parm.capture.timeperframe.numerator);
 
-	dev->fps = parm.parm.capture.timeperframe.numerator/
-			parm.parm.capture.timeperframe.denominator;
+	dev->fps = parm.parm.capture.timeperframe.denominator/
+			parm.parm.capture.timeperframe.numerator;
 
 	return 0;
 }
