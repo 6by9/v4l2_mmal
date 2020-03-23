@@ -1,17 +1,17 @@
 CROSS_COMPILE ?=
 
-CC	:= $(CROSS_COMPILE)gcc
-CFLAGS ?= -Iinclude -I/opt/vc/include -pipe -W -Wall -Wextra -g -O0
+CPP	:= $(CROSS_COMPILE)g++
+CPPFLAGS ?= -Iinclude -I/opt/vc/include -pipe -W -Wall -Wextra -g -O0
 LDFLAGS	?=
 LIBS	:= -L/opt/vc/lib -lrt -lbcm_host -lvcos -lvchiq_arm -pthread -lmmal_core -lmmal_util -lmmal_vc_client -lvcsm
 
-%.o : %.c
-	$(CC) $(CFLAGS) -c -o $@ $<
+%.o : %.cpp
+	$(CPP) $(CPPFLAGS) -c -o $@ $<
 
 all: v4l2_mmal
 
 v4l2_mmal: v4l2_mmal.o
-	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
+	$(CPP) $(LDFLAGS) -o $@ $^ $(LIBS)
 
 clean:
 	-rm -f *.o

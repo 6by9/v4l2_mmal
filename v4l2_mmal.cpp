@@ -1,7 +1,7 @@
 /*
  * v4l2_mmal - hooking together V4L2 and MMAL.
  * Copyright (C) 2018 Raspberry Pi (Trading) Ltd.
- * 
+ *
  * Based on yavta -  Yet Another V4L2 Test Application
  * Copyright (C) 2005-2010 Laurent Pinchart <laurent.pinchart@ideasonboard.com>
  *
@@ -51,7 +51,7 @@
 #define MAX_COMPONENTS 4
 
 struct destinations {
-	char *component_name;
+	const char *component_name;
 	MMAL_FOURCC_T output_encoding;
 	MMAL_PORT_BH_CB_T cb;
 };
@@ -312,7 +312,7 @@ static enum v4l2_field v4l2_field_from_string(const char *name)
 			return fields[i].field;
 	}
 
-	return -1;
+	return V4L2_FIELD_NONE;
 }
 
 static const char *v4l2_field_name(enum v4l2_field field)
@@ -435,7 +435,7 @@ static int video_get_format(struct device *dev)
 	print("Video format: %s (%08x) %ux%u (stride %u) field %s buffer size %u\n",
 		v4l2_format_name(fmt.fmt.pix.pixelformat), fmt.fmt.pix.pixelformat,
 		fmt.fmt.pix.width, fmt.fmt.pix.height, fmt.fmt.pix.bytesperline,
-		v4l2_field_name(fmt.fmt.pix_mp.field),
+		v4l2_field_name((enum v4l2_field)fmt.fmt.pix_mp.field),
 		fmt.fmt.pix.sizeimage);
 
 	return 0;
@@ -497,7 +497,7 @@ static int video_set_format(struct device *dev, unsigned int w, unsigned int h,
 	print("Video format set: %s (%08x) %ux%u (stride %u) field %s buffer size %u\n",
 		v4l2_format_name(fmt.fmt.pix.pixelformat), fmt.fmt.pix.pixelformat,
 		fmt.fmt.pix.width, fmt.fmt.pix.height, fmt.fmt.pix.bytesperline,
-		v4l2_field_name(fmt.fmt.pix.field),
+		v4l2_field_name((enum v4l2_field)fmt.fmt.pix.field),
 		fmt.fmt.pix.sizeimage);
 
 	return 0;
@@ -599,7 +599,7 @@ static int video_alloc_buffers(struct device *dev, int nbufs)
 
 	print("%u buffers requested.\n", rb.count);
 
-	buffers = malloc(rb.count * sizeof buffers[0]);
+	buffers = (struct buffer*)malloc(rb.count * sizeof buffers[0]);
 	if (buffers == NULL)
 		return -ENOMEM;
 
@@ -666,7 +666,7 @@ static int video_alloc_buffers(struct device *dev, int nbufs)
 			else
 			{
 				dev->can_zero_copy = MMAL_FALSE;
-				mmal_buf->data = buffers[i].mem[0];	//Only deal with the single planar API
+				mmal_buf->data = (uint8_t*)buffers[i].mem[0];	//Only deal with the single planar API
 			}
 
 			mmal_buf->alloc_size = buf.length;
@@ -1104,7 +1104,7 @@ static int setup_mmal(struct device *dev, int nbufs, const char *filename)
 	unsigned int mmal_stride = mmal_encoding_width_to_stride(info->mmal_encoding, port->format->es->video.width);
 	if (mmal_stride != fmt.fmt.pix.bytesperline) {
 		if (video_set_format(dev, fmt.fmt.pix.width, fmt.fmt.pix.height, fmt.fmt.pix.pixelformat, mmal_stride,
-				     fmt.fmt.pix.sizeimage, fmt.fmt.pix.field, fmt.fmt.pix.flags) < 0) 
+				     fmt.fmt.pix.sizeimage, (enum v4l2_field)fmt.fmt.pix.field, fmt.fmt.pix.flags) < 0) 
 			print("Failed to adjust stride\n");
 		else
 			// Retrieve settings again so local state is correct
@@ -1154,10 +1154,14 @@ static int setup_mmal(struct device *dev, int nbufs, const char *filename)
 
 		status = mmal_format_full_copy(ip->format, isp_output->format);
 		ip->buffer_num = 3;
-		if (status == MMAL_SUCCESS)
-			status = mmal_port_format_commit(ip);
+		if (status != MMAL_SUCCESS)
+			return -1;
 
-		status += mmal_port_parameter_set_boolean(ip, MMAL_PARAMETER_ZERO_COPY, MMAL_TRUE);
+		status = mmal_port_format_commit(ip);
+		if (status != MMAL_SUCCESS)
+			return -1;
+
+		status = mmal_port_parameter_set_boolean(ip, MMAL_PARAMETER_ZERO_COPY, MMAL_TRUE);
 		if (status != MMAL_SUCCESS)
 			return -1;
 
@@ -1257,7 +1261,7 @@ static int setup_mmal(struct device *dev, int nbufs, const char *filename)
 				char tmp_filename[128];
 				sprintf(tmp_filename, "%u_%s.pts", i, filename);
 
-				dev->components[i].pts_fd = (void*)fopen(tmp_filename, "wb");
+				dev->components[i].pts_fd = fopen(tmp_filename, "wb");
 				if (dev->components[i].pts_fd) /* save header for mkvmerge */
 					fprintf(dev->components[i].pts_fd, "# timecode format v2\n");
 			}
@@ -1405,7 +1409,7 @@ static void video_save_image(struct device *dev, struct v4l2_buffer *buf,
 	int fd;
 
 	size = strlen(pattern);
-	filename = malloc(size + 12);
+	filename = (char*)malloc(size + 12);
 	if (filename == NULL)
 		return;
 
@@ -1545,7 +1549,7 @@ static int video_do_capture(struct device *dev, unsigned int nframes,
 			get_ts_flags(buf.flags, &ts_type, &ts_source);
 			print("%u (%u) [%c] %s %u %u B %ld.%06ld %ld.%06ld %.3f fps ts %s/%s\n", i, buf.index,
 				(buf.flags & V4L2_BUF_FLAG_ERROR) ? 'E' : '-',
-				v4l2_field_name(buf.field),
+				v4l2_field_name((enum v4l2_field)buf.field),
 				buf.sequence, buf.bytesused,
 				buf.timestamp.tv_sec, buf.timestamp.tv_usec,
 				ts.tv_sec, ts.tv_nsec/1000, fps,
@@ -1672,7 +1676,7 @@ int video_set_dv_timings(struct device *dev)
 		} else {
 			double tot_height, tot_width;
 			const struct v4l2_bt_timings *bt = &timings.bt;
-			
+
 			tot_height = bt->height +
 				bt->vfrontporch + bt->vsync + bt->vbackporch +
 				bt->il_vfrontporch + bt->il_vsync + bt->il_vbackporch;
@@ -1988,7 +1992,7 @@ int main(int argc, char *argv[])
 	/* Set the video format. */
 	if (do_set_format) {
 		if (video_set_format(&dev, width, height, pixelformat, stride,
-				     buffer_size, field, fmt_flags) < 0) {
+				     buffer_size, (enum v4l2_field)field, fmt_flags) < 0) {
 			video_close(&dev);
 			return 1;
 		}
